@@ -185,21 +185,40 @@ async function sendMainMenu(to) {
 // ---------------- Products ----------------
 async function sendProductsList(to) {
   try {
-    const res = await axios.get(`https://${SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=5`,
-      { headers:{ "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN }});
-    const products = res.data.products || [];
-    if(!products.length) return sendWhatsAppMessage(to,"❌ No se encontraron productos.");
+    const res = await axios.get(
+      `https://${SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=5`,
+      { headers: { "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN } }
+    );
 
-    const buttons = products.map((p,i)=>{
-      let title = p.title.length > 12 ? p.title.slice(0,12) + "…" : p.title;
-      title = `${title} 💰${p.variants[0].price}`;
-      title = formatButtonTitle(title);
-      return { id:`product_${i}`, title };
+    const products = res.data.products || [];
+    if (!products.length) {
+      return sendWhatsAppMessage(to, "❌ No se encontraron productos.");
+    }
+
+    const buttons = products.map((p, i) => {
+      let baseTitle =
+        p.title.length > 10 ? p.title.slice(0, 10) + "…" : p.title;
+
+      // Add short unique suffix (1, 2, 3…)
+      let title = `${baseTitle} ${i + 1}`;
+
+      // Final hard limit safety
+      title = title.slice(0, 20);
+
+      return {
+        id: `product_${i}`,
+        title
+      };
     });
 
-    await sendWhatsAppButtons(to,"🛍️ Mira nuestros productos destacados:", buttons);
-  } catch(err) {
-    console.error("Error sending product list:", err.response?.data||err.message);
+    await sendWhatsAppButtons(
+      to,
+      "🛍️ Productos destacados:",
+      buttons
+    );
+
+  } catch (err) {
+    console.error("Error sending product list:", err.response?.data || err.message);
   }
 }
 
