@@ -149,7 +149,11 @@ async function verifyOTP(user, lookupValue, enteredOtp) {
   return result;
 }
 
-// ---------------- WhatsApp Helpers ----------------
+// ---------------- WhatsApp Buttons ----------------
+function formatButtonTitle(title) {
+  return title.length > 20 ? title.slice(0, 17) + "…" : title;
+}
+
 async function sendWhatsAppButtons(to, text, buttons) {
   const payload = {
     messaging_product: "whatsapp",
@@ -158,7 +162,7 @@ async function sendWhatsAppButtons(to, text, buttons) {
     interactive: {
       type: "button",
       body: { text },
-      action: { buttons: buttons.slice(0,3).map(b=>({type:"reply",reply:{id:b.id,title:b.title}})) }
+      action: { buttons: buttons.slice(0,3).map(b=>({type:"reply",reply:{id:b.id,title:formatButtonTitle(b.title)}})) }
     }
   };
   try {
@@ -169,6 +173,69 @@ async function sendWhatsAppButtons(to, text, buttons) {
   }
 }
 
+async function sendMainMenu(to) {
+  const buttons = [
+    { id: "check_order", title: "📦 Consultar Pedido" },
+    { id: "browse_products", title: "🛍️ Ver Productos" },
+    { id: "help", title: "❓ Ayuda" },
+  ];
+  await sendWhatsAppButtons(to, "¡Hola! ¿Qué deseas hacer? 🤩", buttons);
+}
+
+// ---------------- Products ----------------
+async function sendProductsList(to) {
+  try {
+    const res = await axios.get(`https://${SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=5`,
+      { headers:{ "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN }});
+    const products = res.data.products || [];
+    if(!products.length) return sendWhatsAppMessage(to,"❌ No se encontraron productos.");
+
+    const buttons = products.map((p,i)=>{
+      let title = p.title.length > 12 ? p.title.slice(0,12) + "…" : p.title;
+      title = `${title} 💰${p.variants[0].price}`;
+      title = formatButtonTitle(title);
+      return { id:`product_${i}`, title };
+    });
+
+    await sendWhatsAppButtons(to,"🛍️ Mira nuestros productos destacados:", buttons);
+  } catch(err) {
+    console.error("Error sending product list:", err.response?.data||err.message);
+  }
+}
+
+async function sendProductDetail(to, selectedId) {
+  try {
+    const index = parseInt(selectedId.split("_")[1],10);
+    const res = await axios.get(`https://${SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=5`,
+      { headers:{ "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN }});
+    const product = res.data.products[index];
+    if(!product) return sendWhatsAppMessage(to,"⚠️ Producto no encontrado.");
+
+    const price = product.variants[0].price;
+    const checkoutUrl = `https://${SHOPIFY_STORE}/cart/${product.variants[0].id}:1`;
+    const buttons = [{ id:"buy_now", title: "Comprar 🛒" }];
+
+    const payload = {
+      messaging_product:"whatsapp",
+      to,
+      type:"interactive",
+      interactive:{
+        type:"button",
+        body:{ text:`🛍️ ${product.title}\n💰 Precio: ${price} COP` },
+        action:{ buttons: buttons.map(b => ({ id: b.id, title: formatButtonTitle(b.title) })) }
+      }
+    };
+
+    await axios.post(`https://graph.facebook.com/v22.0/${WHATSAPP_PHONE_ID}/messages`, payload,
+      { headers:{ Authorization:`Bearer ${WHATSAPP_TOKEN}`, "Content-Type":"application/json"}});
+    await sendWhatsAppMessage(to, `Compra aquí: ${checkoutUrl}`);
+  } catch(err) {
+    console.error("Error product detail:", err.response?.data||err.message);
+    await sendWhatsAppMessage(to,"⚠️ No se pudo obtener detalles del producto.");
+  }
+}
+
+// ---------------- Simple WhatsApp message ----------------
 async function sendWhatsAppMessage(to,message){
   try{
     await axios.post(`https://graph.facebook.com/v22.0/${WHATSAPP_PHONE_ID}/messages`,
@@ -179,93 +246,7 @@ async function sendWhatsAppMessage(to,message){
   }
 }
 
-// ---------------- Products & Purchase Flow ----------------
-async function sendProductsList(to) {
-  try {
-    const res = await axios.get(`https://${SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=5`,
-      { headers:{ "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN }});
-    const products = res.data.products || [];
-    if(!products.length) return sendWhatsAppMessage(to,"❌ No se encontraron productos.");
-
-    const buttons = products.map((p,i)=>{
-      let title = p.title.length > 12 ? p.title.slice(0,12) + "…" : p.title;
-      title = `${title} 💰 ${p.variants[0].price} COP`;
-      return { id:`product_${i}`, title };
-    });
-    await sendWhatsAppButtons(to,"🛍️ Mira nuestros productos destacados:",buttons);
-    orderCache.set(to, { products });
-  } catch(err) { console.error(err.response?.data||err.message); }
-}
-
-async function sendProductDetail(to, selectedId) {
-  const cached = orderCache.get(to);
-  if(!cached) return sendWhatsAppMessage(to,"⚠️ No hay producto seleccionado.");
-  const index = parseInt(selectedId.split("_")[1],10);
-  const product = cached.products[index];
-  if(!product) return sendWhatsAppMessage(to,"⚠️ Producto no encontrado.");
-
-  const price = product.variants[0].price;
-  const variantId = product.variants[0].id;
-  const checkoutUrl = `https://${SHOPIFY_STORE}/cart/${variantId}:1`;
-
-  const buttons = [{ id:"buy_now", title:`Comprar 🛒` }];
-  const payload = {
-    messaging_product:"whatsapp",
-    to,
-    type:"interactive",
-    interactive:{
-      type:"button",
-      body:{ text:`🛍️ ${product.title}\n💰 Precio: ${price} COP` },
-      action:{ buttons }
-    }
-  };
-  try {
-    await axios.post(`https://graph.facebook.com/v22.0/${WHATSAPP_PHONE_ID}/messages`, payload,
-      { headers:{ Authorization:`Bearer ${WHATSAPP_TOKEN}`, "Content-Type":"application/json"}});
-    await sendWhatsAppMessage(to, `Compra aquí: ${checkoutUrl}`);
-    // Store for follow-up if quantity selection is added
-    orderCache.set(to, { selectedProduct: product });
-  } catch(err){ console.error("Error product detail:", err.response?.data||err.message); }
-}
-
-// ---------------- AI Grounded Suggestions ----------------
-async function suggestProductsGrounded(userMessage, from) {
-  try {
-    const res = await axios.get(`https://${SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=50`,
-      { headers:{ "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN }});
-    const products = res.data.products || [];
-    if(!products.length) return sendWhatsAppMessage(from, "❌ No hay productos disponibles.");
-
-    const productList = products.map(p=>`${p.title} (${p.variants[0].price} COP)`).join("\n");
-
-    const aiResponse = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "Eres un asistente de ventas para WhatsApp en Colombia. Solo puedes recomendar productos que aparecen en la lista proporcionada. No inventes productos. Usa emojis y un lenguaje amigable." },
-        { role: "user", content: `El cliente dice: "${userMessage}". Los productos disponibles en la tienda son:\n${productList}\nElige hasta 5 productos que coincidan mejor con lo que busca el cliente y devuelve solo los títulos exactos.` }
-      ]
-    });
-
-    const selectedTitles = aiResponse.choices[0].message.content.split("\n").map(t=>t.trim()).filter(Boolean);
-    const matchedProducts = products.filter(p => selectedTitles.includes(p.title)).slice(0,5);
-    if(!matchedProducts.length) return sendWhatsAppMessage(from, "❌ No encontré productos que coincidan con tu descripción.");
-
-    const buttons = matchedProducts.map((p,i)=>{
-      let title = p.title.length>12 ? p.title.slice(0,12)+"…" : p.title;
-      title = `${title} 💰 ${p.variants[0].price} COP`;
-      return { id:`product_${i}`, title };
-    });
-
-    await sendWhatsAppButtons(from, "✨ Según lo que buscas, te recomiendo estos productos:", buttons);
-    orderCache.set(from, { products: matchedProducts });
-
-  } catch(err) {
-    console.error(err.response?.data||err.message);
-    await sendWhatsAppMessage(from,"⚠️ No se pudo procesar tu solicitud. Intenta de nuevo.");
-  }
-}
-
-// ---------------- OpenAI Fallback ----------------
+// ---------------- OpenAI fallback ----------------
 async function askAI(userMessage){
   const completion = await openai.chat.completions.create({
     model:"gpt-4o-mini",
@@ -302,24 +283,16 @@ app.post("/webhook", async (req,res)=>{
     const interactive = message?.interactive;
     if(interactive?.type==="button_reply"){
       const btnId = interactive.button_reply.id;
-
       if(btnId==="check_order") await sendWhatsAppMessage(from,"Por favor comparte tu número de pedido (#1234), email o teléfono usado.");
       else if(btnId==="browse_products") await sendProductsList(from);
       else if(btnId==="help") await sendWhatsAppMessage(from,"Puedo ayudarte a rastrear pedidos, ver productos y responder preguntas.");
-      else if(btnId.startsWith("product_")) await sendProductDetail(from, btnId);
-      else await sendWhatsAppMessage(from,"¡Gracias por tu interacción!"); // default fallback
-
+      else if(btnId==="buy_now") await sendWhatsAppMessage(from,"¡Gracias por tu compra! 🛒");
       return res.sendStatus(200);
     }
 
     let reply;
     if(lower.includes("menu")||lower.includes("hola")||lower.includes("hi")||lower.includes("hello")){
-      await sendWhatsAppButtons(from,"¡Hola! ¿Qué deseas hacer? 🤩", [
-        { id: "check_order", title: "📦 Consultar Pedido" },
-        { id: "browse_products", title: "🛍️ Ver Productos" },
-        { id: "help", title: "❓ Ayuda" },
-      ]);
-      return res.sendStatus(200);
+      await sendMainMenu(from); return res.sendStatus(200);
     }else if(lower.includes("pedido")||lower.includes("tracking")||lower.includes("track")){
       reply = "Por favor comparte tu número de pedido (#1234), email o teléfono usado.";
     }else if(isEmail(userText)||isPhone(userText)){
@@ -341,8 +314,6 @@ app.post("/webhook", async (req,res)=>{
       await sendProductsList(from); return res.sendStatus(200);
     }else if(userText.startsWith("product_")){
       await sendProductDetail(from,userText); return res.sendStatus(200);
-    }else if(userText.length > 10 && !isEmail(userText) && !isPhone(userText) && !userText.startsWith("#")){
-      await suggestProductsGrounded(userText, from); return res.sendStatus(200);
     }else{
       reply = await askAI(userText);
     }
