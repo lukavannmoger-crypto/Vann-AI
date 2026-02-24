@@ -21,28 +21,29 @@ if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID || !VERIFY_TOKEN) {
   process.exit(1);
 }
 
-/* ================= MEMORY ================= */
+/* ================= MEMORY / SESSION ================= */
 const otpStore = new Map();
 const otpRateLimit = new Map();
 const orderCache = new Map();
 const abandonedCarts = {};
 const humanTakeover = new Set();
+const userSessions = new Map(); // Tracks user language
+
+function getUserLang(from, text) {
+  if (userSessions.has(from)) return userSessions.get(from);
+  const lang = /hola|quiero|busco|necesito/i.test(text) ? "es" : "en";
+  userSessions.set(from, lang);
+  return lang;
+}
 
 /* ================= UTILITIES ================= */
 function formatButtonTitle(title) {
   return !title ? "Option" : title.length > 20 ? title.slice(0, 17) + "…" : title;
 }
 
-function detectLanguage(text) {
-  return /hola|quiero|busco|necesito/i.test(text) ? "es" : "en";
-}
-
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
-
-function isEmail(text) { return /\S+@\S+\.\S+/.test(text); }
-function isPhone(text) { return /^[+]?[\d\s\-]{8,15}$/.test(text); }
 
 /* ================= WHATSAPP ================= */
 async function sendWhatsAppMessage(to, message) {
@@ -100,7 +101,7 @@ async function getShopifyProducts(limit = 20) {
   }));
 }
 
-/* ================= AI RECOMMENDER ================= */
+/* ================= AI PRODUCT RECOMMENDER ================= */
 async function aiPickProducts(userText, products, mode = "single") {
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
@@ -156,7 +157,9 @@ async function sendProduct(to, product) {
 }
 
 /* ================= MAIN MENU ================= */
-async function sendMainMenu(to, lang = "en") {
+async function sendMainMenu(to) {
+  const lang = userSessions.get(to) || "en";
+
   const text = lang === "es"
     ? "👋 Hola! ¿Qué te gustaría hacer hoy?"
     : "👋 Hi! What would you like to do today?";
@@ -183,7 +186,6 @@ async function classifyIntent(userText) {
         { role: "user", content: userText }
       ]
     });
-
     return completion.choices[0].message.content.trim();
   } catch {
     return "unknown";
@@ -209,12 +211,11 @@ app.post("/webhook", async (req, res) => {
 
     const from = message.from;
     const userText = message.text?.body || "";
-    const lower = userText.toLowerCase();
-    const lang = detectLanguage(lower);
+    const lang = getUserLang(from, userText);
 
     if (humanTakeover.has(from)) return res.sendStatus(200);
 
-    // === BUTTON REPLIES HANDLING ===
+    // === BUTTON CLICK HANDLING ===
     const buttonId = message.button?.payload;
     if (buttonId) {
       switch (buttonId) {
@@ -243,13 +244,13 @@ app.post("/webhook", async (req, res) => {
           break;
 
         default:
-          await sendMainMenu(from, lang);
+          await sendMainMenu(from);
           break;
       }
       return res.sendStatus(200);
     }
 
-    // === AI INTENT CLASSIFICATION ===
+    // === AI INTENT FOR TEXT ===
     const intent = await classifyIntent(userText);
 
     if (intent === "human_agent") {
@@ -269,8 +270,7 @@ app.post("/webhook", async (req, res) => {
         lang === "es" ? "📝 Por favor, proporciona tu número de pedido." : "📝 Please provide your order number."
       );
     } else {
-      // unknown: show main menu
-      await sendMainMenu(from, lang);
+      await sendMainMenu(from); // show menu in correct language
     }
 
     res.sendStatus(200);
