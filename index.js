@@ -1,67 +1,86 @@
-import express from "express";
-import axios from "axios";
-import dotenv from "dotenv";
-import OpenAI from "openai";
-
-dotenv.config();
+require("dotenv").config();
+const express = require("express");
+const axios = require("axios");
+const OpenAI = require("openai");
 
 const app = express();
 app.use(express.json());
 
-/* ================= ENV ================= */
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 const {
-  PORT = 3000,
   WHATSAPP_TOKEN,
   WHATSAPP_PHONE_ID,
   VERIFY_TOKEN,
   SHOPIFY_STORE,
-  SHOPIFY_ADMIN_TOKEN,
-  OPENAI_API_KEY
+  SHOPIFY_ADMIN_TOKEN
 } = process.env;
 
-/* ================= OPENAI ================= */
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID || !VERIFY_TOKEN) {
+  console.error("❌ Missing required environment variables");
+  process.exit(1);
+}
 
 /* ================= MEMORY ================= */
+const otpStore = new Map();
+const otpRateLimit = new Map();
+const orderCache = new Map();
 const abandonedCarts = {};
 const humanTakeover = new Set();
 
-/* ================= HELPERS ================= */
-const formatButtonTitle = t =>
-  !t ? "Option" : t.length > 20 ? t.slice(0, 17) + "…" : t;
-
-const detectLanguage = text =>
-  /hola|quiero|busco|necesito/i.test(text) ? "es" : "en";
-
-/* ================= WHATSAPP ================= */
-async function sendWhatsAppMessage(to, text) {
-  await axios.post(
-    `https://graph.facebook.com/v22.0/${WHATSAPP_PHONE_ID}/messages`,
-    { messaging_product: "whatsapp", to, type: "text", text: { body: text } },
-    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } }
-  );
+/* ================= UTILITIES ================= */
+function formatButtonTitle(title) {
+  return !title ? "Option" : title.length > 20 ? title.slice(0, 17) + "…" : title;
 }
 
-async function sendWhatsAppButtons(to, body, buttons) {
-  await axios.post(
-    `https://graph.facebook.com/v22.0/${WHATSAPP_PHONE_ID}/messages`,
-    {
-      messaging_product: "whatsapp",
-      to,
-      type: "interactive",
-      interactive: {
-        type: "button",
-        body: { text: body },
-        action: {
-          buttons: buttons.map(b => ({
-            type: "reply",
-            reply: { id: b.id, title: formatButtonTitle(b.title) }
-          }))
+function detectLanguage(text) {
+  return /hola|quiero|busco|necesito/i.test(text) ? "es" : "en";
+}
+
+function generateOTP() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+function isEmail(text) { return /\S+@\S+\.\S+/.test(text); }
+function isPhone(text) { return /^[+]?[\d\s\-]{8,15}$/.test(text); }
+
+/* ================= WHATSAPP ================= */
+async function sendWhatsAppMessage(to, message) {
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v22.0/${WHATSAPP_PHONE_ID}/messages`,
+      { messaging_product: "whatsapp", to, type: "text", text: { body: message } },
+      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } }
+    );
+  } catch (err) {
+    console.error("WhatsApp message error:", err.response?.data || err.message);
+  }
+}
+
+async function sendWhatsAppButtons(to, text, buttons) {
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v22.0/${WHATSAPP_PHONE_ID}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to,
+        type: "interactive",
+        interactive: {
+          type: "button",
+          body: { text },
+          action: {
+            buttons: buttons.slice(0, 3).map(b => ({
+              type: "reply",
+              reply: { id: b.id, title: formatButtonTitle(b.title) }
+            }))
+          }
         }
-      }
-    },
-    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } }
-  );
+      },
+      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } }
+    );
+  } catch (err) {
+    console.error("Button error:", err.response?.data || err.message);
+  }
 }
 
 /* ================= SHOPIFY ================= */
@@ -88,12 +107,7 @@ async function aiPickProducts(userText, products, mode = "single") {
     messages: [
       {
         role: "system",
-        content: `
-You are a shopping assistant.
-ONLY select from the list.
-Mode: ${mode}
-Return ONLY a JSON array of product IDs.
-`
+        content: `ONLY choose products from the list. Return a JSON array of product IDs. Mode: ${mode}`
       },
       {
         role: "user",
@@ -115,7 +129,7 @@ ${products.map(p => `- ${p.id}: ${p.title}`).join("\n")}
   }
 }
 
-/* ================= PRODUCT CARD ================= */
+/* ================= PRODUCT SENDER ================= */
 async function sendProduct(to, product) {
   if (product.image) {
     await axios.post(
@@ -132,11 +146,11 @@ async function sendProduct(to, product) {
 
   await sendWhatsAppButtons(
     to,
-    `🛍️ *${product.title}*\n💰 ${product.price}`,
+    `🛍️ *${product.title}*\n💰 ${product.price} COP`,
     [{ id: `buy_${product.id}`, title: "Comprar" }]
   );
 
-  await sendWhatsAppMessage(to, `🛒 ${product.url}`);
+  await sendWhatsAppMessage(to, `🛒 Compra aquí:\n${product.url}`);
 
   abandonedCarts[to] = product;
 }
@@ -155,57 +169,54 @@ app.get("/webhook", (req, res) => {
 /* ================= WEBHOOK ================= */
 app.post("/webhook", async (req, res) => {
   try {
-    const msg = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!msg?.text) return res.sendStatus(200);
+    const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    if (!message) return res.sendStatus(200);
 
-    const from = msg.from;
-    const text = msg.text.body.toLowerCase();
-    const lang = detectLanguage(text);
+    const from = message.from;
+    const userText = message.text?.body || "";
+    const lower = userText.toLowerCase();
+    const lang = detectLanguage(lower);
 
     if (humanTakeover.has(from)) return res.sendStatus(200);
 
-    if (/agent|agente|human/i.test(text)) {
+    if (/agent|agente|human/i.test(lower)) {
       humanTakeover.add(from);
-      await sendWhatsAppMessage(
-        from,
+      await sendWhatsAppMessage(from,
         lang === "es"
-          ? "👤 Un agente humano continuará."
+          ? "👤 Un agente humano continuará la conversación."
           : "👤 A human agent will assist you."
       );
       return res.sendStatus(200);
     }
 
-    const products = await getShopifyProducts();
-
-    // Outfit bundles
-    if (/outfit|conjunto|combinar/i.test(text)) {
-      const ids = await aiPickProducts(text, products, "bundle");
-      for (const p of products.filter(x => ids.includes(x.id)).slice(0, 3)) {
-        await sendProduct(from, p);
-      }
+    /* ===== AI PRODUCT INTENT ===== */
+    if (/quiero|busco|need|want|camisa|shirt|hoodie|pantalon|pants/i.test(lower)) {
+      const products = await getShopifyProducts();
+      const ids = await aiPickProducts(userText, products);
+      const matches = products.filter(p => ids.includes(p.id)).slice(0, 3);
+      for (const p of matches) await sendProduct(from, p);
       return res.sendStatus(200);
     }
 
-    // Normal intent
-    if (/quiero|busco|need|want|camisa|shirt|pants|hoodie/i.test(text)) {
-      const ids = await aiPickProducts(text, products);
-      for (const p of products.filter(x => ids.includes(x.id)).slice(0, 3)) {
-        await sendProduct(from, p);
-      }
+    if (/outfit|conjunto|combinar/i.test(lower)) {
+      const products = await getShopifyProducts();
+      const ids = await aiPickProducts(userText, products, "bundle");
+      const matches = products.filter(p => ids.includes(p.id)).slice(0, 3);
+      for (const p of matches) await sendProduct(from, p);
       return res.sendStatus(200);
     }
 
     await sendWhatsAppMessage(
       from,
       lang === "es"
-        ? "👋 Puedo ayudarte a encontrar ropa y accesorios."
-        : "👋 I can help you find clothes and accessories."
+        ? "👋 ¿Te ayudo a encontrar productos o revisar un pedido?"
+        : "👋 I can help you find products or check an order."
     );
 
     res.sendStatus(200);
   } catch (err) {
-    console.error(err.response?.data || err.message);
-    res.sendStatus(200);
+    console.error(err);
+    res.sendStatus(500);
   }
 });
 
@@ -221,6 +232,5 @@ setInterval(async () => {
 }, 1000 * 60 * 30);
 
 /* ================= SERVER ================= */
-app.listen(PORT, () =>
-  console.log(`✅ WhatsApp AI Bot running on ${PORT}`)
-);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
