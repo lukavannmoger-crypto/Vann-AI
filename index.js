@@ -215,8 +215,12 @@ app.post("/webhook", async (req, res) => {
 
     if (humanTakeover.has(from)) return res.sendStatus(200);
 
-    // === BUTTON CLICK HANDLING ===
-    const buttonId = message.button?.payload;
+    // === FIXED BUTTON CLICK HANDLING ===
+    let buttonId = null;
+    if (message.type === "interactive" && message.interactive?.type === "button_reply") {
+      buttonId = message.interactive.button_reply.id;
+    }
+
     if (buttonId) {
       switch (buttonId) {
         case "browse_products":
@@ -270,7 +274,7 @@ app.post("/webhook", async (req, res) => {
         lang === "es" ? "📝 Por favor, proporciona tu número de pedido." : "📝 Please provide your order number."
       );
     } else {
-      await sendMainMenu(from); // show menu in correct language
+      await sendMainMenu(from); // unknown: show menu in correct language
     }
 
     res.sendStatus(200);
