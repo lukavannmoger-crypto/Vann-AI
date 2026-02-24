@@ -155,6 +155,41 @@ async function sendProduct(to, product) {
   abandonedCarts[to] = product;
 }
 
+/* ================= MAIN MENU ================= */
+async function sendMainMenu(to, lang = "en") {
+  const text = lang === "es"
+    ? "👋 Hola! ¿Qué te gustaría hacer hoy?"
+    : "👋 Hi! What would you like to do today?";
+
+  const buttons = [
+    { id: "browse_products", title: lang === "es" ? "Ver productos" : "Browse products" },
+    { id: "check_order", title: lang === "es" ? "Revisar pedido" : "Check order" },
+    { id: "human_agent", title: lang === "es" ? "Hablar con agente" : "Talk to agent" },
+  ];
+
+  await sendWhatsAppButtons(to, text, buttons);
+}
+
+/* ================= AI INTENT CLASSIFIER ================= */
+async function classifyIntent(userText) {
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: "Classify the user message into one of: [browse_products, check_order, human_agent, unknown]. Respond only with the label."
+        },
+        { role: "user", content: userText }
+      ]
+    });
+
+    return completion.choices[0].message.content.trim();
+  } catch {
+    return "unknown";
+  }
+}
+
 /* ================= WEBHOOK VERIFY ================= */
 app.get("/webhook", (req, res) => {
   if (
@@ -179,39 +214,64 @@ app.post("/webhook", async (req, res) => {
 
     if (humanTakeover.has(from)) return res.sendStatus(200);
 
-    if (/agent|agente|human/i.test(lower)) {
-      humanTakeover.add(from);
-      await sendWhatsAppMessage(from,
-        lang === "es"
-          ? "👤 Un agente humano continuará la conversación."
-          : "👤 A human agent will assist you."
-      );
+    // === BUTTON REPLIES HANDLING ===
+    const buttonId = message.button?.payload;
+    if (buttonId) {
+      switch (buttonId) {
+        case "browse_products":
+          {
+            const products = await getShopifyProducts();
+            const ids = await aiPickProducts("muéstrame productos", products);
+            const matches = products.filter(p => ids.includes(p.id)).slice(0, 3);
+            for (const p of matches) await sendProduct(from, p);
+          }
+          break;
+
+        case "check_order":
+          await sendWhatsAppMessage(
+            from,
+            lang === "es" ? "📝 Por favor, proporciona tu número de pedido." : "📝 Please provide your order number."
+          );
+          break;
+
+        case "human_agent":
+          humanTakeover.add(from);
+          await sendWhatsAppMessage(
+            from,
+            lang === "es" ? "👤 Un agente humano continuará la conversación." : "👤 A human agent will assist you."
+          );
+          break;
+
+        default:
+          await sendMainMenu(from, lang);
+          break;
+      }
       return res.sendStatus(200);
     }
 
-    /* ===== AI PRODUCT INTENT ===== */
-    if (/quiero|busco|need|want|camisa|shirt|hoodie|pantalon|pants/i.test(lower)) {
+    // === AI INTENT CLASSIFICATION ===
+    const intent = await classifyIntent(userText);
+
+    if (intent === "human_agent") {
+      humanTakeover.add(from);
+      await sendWhatsAppMessage(
+        from,
+        lang === "es" ? "👤 Un agente humano continuará la conversación." : "👤 A human agent will assist you."
+      );
+    } else if (intent === "browse_products") {
       const products = await getShopifyProducts();
       const ids = await aiPickProducts(userText, products);
       const matches = products.filter(p => ids.includes(p.id)).slice(0, 3);
       for (const p of matches) await sendProduct(from, p);
-      return res.sendStatus(200);
+    } else if (intent === "check_order") {
+      await sendWhatsAppMessage(
+        from,
+        lang === "es" ? "📝 Por favor, proporciona tu número de pedido." : "📝 Please provide your order number."
+      );
+    } else {
+      // unknown: show main menu
+      await sendMainMenu(from, lang);
     }
-
-    if (/outfit|conjunto|combinar/i.test(lower)) {
-      const products = await getShopifyProducts();
-      const ids = await aiPickProducts(userText, products, "bundle");
-      const matches = products.filter(p => ids.includes(p.id)).slice(0, 3);
-      for (const p of matches) await sendProduct(from, p);
-      return res.sendStatus(200);
-    }
-
-    await sendWhatsAppMessage(
-      from,
-      lang === "es"
-        ? "👋 ¿Te ayudo a encontrar productos o revisar un pedido?"
-        : "👋 I can help you find products or check an order."
-    );
 
     res.sendStatus(200);
   } catch (err) {
